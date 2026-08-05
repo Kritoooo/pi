@@ -17,6 +17,7 @@ import {
 	type DeferredCancelOptions,
 	type DeferredFetchOptions,
 	type DeferredHandle,
+	InMemoryCredentialStore,
 	lazyStream,
 	type Model,
 	type Models,
@@ -40,6 +41,7 @@ import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
 import { getAgentDir } from "../config.ts";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
 import { AuthStorage as DefaultAuthStorage } from "./auth-storage.ts";
+import { createManagedProviders, type ManagedConfigSnapshot } from "./managed-config.ts";
 import { ModelConfig } from "./model-config.ts";
 import { FileModelsStore, InMemoryCodingAgentModelsStore } from "./models-store.ts";
 import {
@@ -64,6 +66,8 @@ interface ModelRuntimeSnapshot {
 }
 
 export interface CreateModelRuntimeOptions {
+	/** Complete managed-only provider snapshot. Local provider and credential sources are ignored when set. */
+	managedConfig?: ManagedConfigSnapshot;
 	/** Credential storage. Defaults to the file at authPath. */
 	credentials?: CredentialStore;
 	authPath?: string;
@@ -137,6 +141,7 @@ export class ModelRuntime implements Models {
 	private readonly compositionErrors = new Map<string, string>();
 	private readonly modelsPath: string | undefined;
 	private readonly modelNetworkEnabled: boolean;
+	private readonly managedMode: boolean;
 	private config: ModelConfig;
 	private snapshot: ModelRuntimeSnapshot = {
 		all: [],
@@ -158,11 +163,13 @@ export class ModelRuntime implements Models {
 		modelsStore: ModelsStore,
 		providers: readonly Provider[],
 		modelNetworkEnabled: boolean,
+		managedMode: boolean,
 	) {
 		this.credentials = credentials;
 		this.config = config;
 		this.modelsPath = modelsPath;
 		this.modelNetworkEnabled = modelNetworkEnabled;
+		this.managedMode = managedMode;
 		this.defaultBuiltins = new Map(providers.map((provider) => [provider.id, provider]));
 		for (const [providerId, provider] of this.defaultBuiltins) this.builtins.set(providerId, provider);
 		this.models = createModels({ credentials, modelsStore });
@@ -170,6 +177,20 @@ export class ModelRuntime implements Models {
 	}
 
 	static async create(options: CreateModelRuntimeOptions = {}): Promise<ModelRuntime> {
+		if (options.managedConfig) {
+			const runtime = new ModelRuntime(
+				new RuntimeCredentials(new InMemoryCredentialStore()),
+				await ModelConfig.load(undefined),
+				undefined,
+				new InMemoryCodingAgentModelsStore(),
+				createManagedProviders(options.managedConfig),
+				false,
+				true,
+			);
+			await runtime.refresh({ allowNetwork: false, signal: options.signal });
+			return runtime;
+		}
+
 		const credentials = new RuntimeCredentials(options.credentials ?? DefaultAuthStorage.create(options.authPath));
 		const modelsPath =
 			options.modelsPath === null ? undefined : (options.modelsPath ?? join(getAgentDir(), "models.json"));
@@ -194,6 +215,7 @@ export class ModelRuntime implements Models {
 			modelsStore,
 			providers,
 			process.env.PI_OFFLINE === undefined,
+			false,
 		);
 		runtime.configureRadiusProviders();
 		runtime.rebuildProviders();
@@ -385,6 +407,10 @@ export class ModelRuntime implements Models {
 		return this.models.getProviders();
 	}
 
+	isManaged(): boolean {
+		return this.managedMode;
+	}
+
 	getProvider(providerId: string): Provider | undefined {
 		return this.models.getProvider(providerId);
 	}
@@ -473,14 +499,17 @@ export class ModelRuntime implements Models {
 		providerOrModel: string | Model<Api>,
 		overrides: ModelRuntimeAuthOverrides = {},
 	): Promise<AuthResult | undefined> {
-		if (typeof providerOrModel === "string") return this.models.getAuth(providerOrModel, overrides);
-		const resolution = await this.models.getAuth(providerOrModel, overrides);
+		const effectiveOverrides = this.managedMode
+			? { signal: overrides.signal, minOAuthValidityMs: overrides.minOAuthValidityMs }
+			: overrides;
+		if (typeof providerOrModel === "string") return this.models.getAuth(providerOrModel, effectiveOverrides);
+		const resolution = await this.models.getAuth(providerOrModel, effectiveOverrides);
 		if (!resolution) return undefined;
 		const configuredHeaders = resolveConfiguredModelHeaders(
 			providerOrModel,
 			this.config.getProvider(providerOrModel.provider),
 			this.extensionProviders.get(providerOrModel.provider),
-			{ ...(resolution.env ?? {}), ...(overrides.env ?? {}) },
+			{ ...(resolution.env ?? {}), ...(effectiveOverrides.env ?? {}) },
 		);
 		return {
 			...resolution,
@@ -534,6 +563,9 @@ export class ModelRuntime implements Models {
 	}
 
 	setRuntimeApiKey(providerId: string, apiKey: string, options: AuthOperationOptions = {}): Promise<void> {
+		if (this.managedMode) {
+			return Promise.reject(new ModelsError("auth", "Runtime API keys are unavailable in managed mode"));
+		}
 		const signal = operationSignal(options.signal);
 		return this.enqueueCredentialOperation(providerId, signal, async () => {
 			this.credentials.setRuntimeApiKey(providerId, apiKey);
@@ -547,6 +579,9 @@ export class ModelRuntime implements Models {
 	}
 
 	removeRuntimeApiKey(providerId: string, options: AuthOperationOptions = {}): Promise<void> {
+		if (this.managedMode) {
+			return Promise.reject(new ModelsError("auth", "Runtime API keys are unavailable in managed mode"));
+		}
 		const signal = operationSignal(options.signal);
 		return this.enqueueCredentialOperation(providerId, signal, async () => {
 			this.credentials.removeRuntimeApiKey(providerId);
@@ -559,6 +594,7 @@ export class ModelRuntime implements Models {
 	}
 
 	getProviderAuthStatus(providerId: string): AuthStatus {
+		if (this.managedMode && this.models.getProvider(providerId)) return { configured: true, source: "managed" };
 		if (this.credentials.hasRuntimeApiKey(providerId)) return { configured: true, source: "runtime" };
 		if (this.snapshot.storedProviders.has(providerId)) return { configured: true, source: "stored" };
 		const configured = configuredRequestAuthStatus(
@@ -589,10 +625,14 @@ export class ModelRuntime implements Models {
 
 		const { transformHeaders, ...rawProviderOptions } = options ?? {};
 		const providerOptions = rawProviderOptions as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions;
-		let headers = mergeHeaders(resolution.auth.headers, providerOptions.headers);
+		let headers = this.managedMode
+			? mergeHeaders(providerOptions.headers, resolution.auth.headers)
+			: mergeHeaders(resolution.auth.headers, providerOptions.headers);
 		if (transformHeaders) headers = await transformHeaders(headers ?? {});
-		const env =
-			resolution.env || providerOptions.env
+		if (this.managedMode) headers = mergeHeaders(headers, resolution.auth.headers);
+		const env = this.managedMode
+			? resolution.env
+			: resolution.env || providerOptions.env
 				? { ...(resolution.env ?? {}), ...(providerOptions.env ?? {}) }
 				: undefined;
 		return {
@@ -600,7 +640,7 @@ export class ModelRuntime implements Models {
 			model: resolution.auth.baseUrl ? { ...model, baseUrl: resolution.auth.baseUrl } : model,
 			options: {
 				...providerOptions,
-				apiKey: providerOptions.apiKey ?? resolution.auth.apiKey,
+				apiKey: this.managedMode ? resolution.auth.apiKey : (providerOptions.apiKey ?? resolution.auth.apiKey),
 				headers,
 				env,
 			} as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions,
@@ -671,6 +711,9 @@ export class ModelRuntime implements Models {
 	}
 
 	login(providerId: string, type: AuthType, interaction: AuthInteraction): Promise<Credential> {
+		if (this.managedMode) {
+			return Promise.reject(new ModelsError("auth", "Provider login is unavailable in managed mode"));
+		}
 		const signal = operationSignal(interaction.signal);
 		return this.enqueueCredentialOperation(providerId, signal, async () => {
 			const credential = await this.models.login(providerId, type, { ...interaction, signal });
@@ -680,6 +723,9 @@ export class ModelRuntime implements Models {
 	}
 
 	logout(providerId: string, options: AuthOperationOptions = {}): Promise<void> {
+		if (this.managedMode) {
+			return Promise.reject(new ModelsError("auth", "Provider logout is unavailable in managed mode"));
+		}
 		const signal = operationSignal(options.signal);
 		return this.enqueueCredentialOperation(providerId, signal, async () => {
 			await this.models.logout(providerId, { signal });
@@ -688,8 +734,10 @@ export class ModelRuntime implements Models {
 	}
 
 	async refresh(options: ModelsRefreshOptions = {}): Promise<ModelsRefreshResult> {
-		this.config = await ModelConfig.load(this.modelsPath);
-		this.configureRadiusProviders();
+		if (!this.managedMode) {
+			this.config = await ModelConfig.load(this.modelsPath);
+			this.configureRadiusProviders();
+		}
 		if (options.providers) {
 			for (const providerId of new Set(options.providers)) this.recomposeProvider(providerId);
 			this.updateModelSnapshot();
@@ -698,7 +746,7 @@ export class ModelRuntime implements Models {
 		}
 		const refreshOptions = {
 			...options,
-			allowNetwork: options.allowNetwork ?? this.modelNetworkEnabled,
+			allowNetwork: this.managedMode ? false : (options.allowNetwork ?? this.modelNetworkEnabled),
 		};
 		// Published pi-ai builds before ModelsStore returned void and accepted a provider ID.
 		// The fallback keeps source-mode CLI tests working without rebuilding workspace dependencies.
@@ -731,6 +779,7 @@ export class ModelRuntime implements Models {
 	}
 
 	registerNativeProvider(provider: Provider): void {
+		if (this.managedMode) throw new Error("Provider registration is unavailable in managed mode.");
 		if (!provider.id.trim()) throw new Error("Provider id must not be empty.");
 		this.extensionProviders.delete(provider.id);
 		this.nativeExtensionProviders.set(provider.id, provider);
@@ -740,6 +789,7 @@ export class ModelRuntime implements Models {
 	}
 
 	registerProvider(providerId: string, config: ProviderConfigInput): void {
+		if (this.managedMode) throw new Error("Provider registration is unavailable in managed mode.");
 		// Validate the incoming registration on its own, like the legacy registry:
 		// a broken re-registration must throw without touching the stored config.
 		validateExtensionProvider(providerId, this.builtins.get(providerId), this.config.getProvider(providerId), config);
@@ -778,6 +828,7 @@ export class ModelRuntime implements Models {
 	}
 
 	unregisterProvider(providerId: string): void {
+		if (this.managedMode) throw new Error("Provider registration is unavailable in managed mode.");
 		this.extensionProviders.delete(providerId);
 		this.nativeExtensionProviders.delete(providerId);
 		this.recomposeProvider(providerId);

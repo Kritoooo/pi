@@ -100,6 +100,23 @@ describe("parseArgs", () => {
 			expect(result.apiKey).toBe("sk-test-key");
 		});
 
+		test("parses managed config URL and bootstrap token", () => {
+			const result = parseArgs([
+				"--managed-config-url",
+				"https://config.example.test/pi",
+				"--managed-config-token",
+				"bootstrap-token",
+			]);
+			expect(result.managedConfigUrl).toBe("https://config.example.test/pi");
+			expect(result.managedConfigToken).toBe("bootstrap-token");
+			expect(result.unknownFlags.size).toBe(0);
+		});
+
+		test.each(["--managed-config-url", "--managed-config-token"])("reports a missing value for %s", (flag) => {
+			const result = parseArgs([flag]);
+			expect(result.diagnostics).toEqual([{ type: "error", message: `${flag} requires a value` }]);
+		});
+
 		test("parses --system-prompt", () => {
 			const result = parseArgs(["--system-prompt", "You are a helpful assistant"]);
 			expect(result.systemPrompt).toBe("You are a helpful assistant");

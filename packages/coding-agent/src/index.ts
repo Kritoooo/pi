@@ -167,6 +167,17 @@ export {
 } from "./core/extensions/index.ts";
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
+export {
+	ManagedConfigError,
+	type ManagedConfigErrorCode,
+	type ManagedConfigProvider,
+	type ManagedConfigResolution,
+	ManagedConfigResolver,
+	type ManagedConfigResolverOptions,
+	type ManagedConfigSnapshot,
+	parseManagedConfig,
+	type ResolveManagedConfigOptions,
+} from "./core/managed-config.ts";
 export { convertToLlm } from "./core/messages.ts";
 export { ModelRegistry } from "./core/model-registry.ts";
 export {

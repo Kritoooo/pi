@@ -134,7 +134,7 @@ const AnthropicMessagesCompatSchema = Type.Object({
 	supportsToolReferences: Type.Optional(Type.Boolean()),
 });
 
-const ProviderCompatSchema = Type.Union([
+export const ProviderCompatSchema = Type.Union([
 	OpenAICompletionsCompatSchema,
 	OpenAIResponsesCompatSchema,
 	AnthropicMessagesCompatSchema,
@@ -155,7 +155,7 @@ const ModelCostSchema = Type.Object({
 	tiers: Type.Optional(Type.Array(ModelCostTierSchema)),
 });
 
-const ModelDefinitionSchema = Type.Object({
+export const ModelDefinitionSchema = Type.Object({
 	id: Type.String({ minLength: 1 }),
 	name: Type.Optional(Type.String({ minLength: 1 })),
 	api: Type.Optional(Type.String({ minLength: 1 })),

@@ -72,13 +72,13 @@ export interface ProviderConfigInput {
 
 export type AuthStatus = {
 	configured: boolean;
-	source?: "stored" | "runtime" | "environment" | "fallback" | "models_json_key" | "models_json_command";
+	source?: "stored" | "runtime" | "environment" | "fallback" | "models_json_key" | "models_json_command" | "managed";
 	label?: string;
 };
 
 export const clearApiKeyCache = clearConfigValueCache;
 
-function mergeCompat(
+export function mergeCompat(
 	base: Model<Api>["compat"],
 	override: Model<Api>["compat"] | ModelsJsonModelOverride["compat"],
 ): Model<Api>["compat"] {

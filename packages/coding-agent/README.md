@@ -142,6 +142,8 @@ See [docs/providers.md](docs/providers.md) for other provider setup instructions
 
 **Custom providers & models:** Add providers via `~/.pi/agent/models.json` if they speak a supported API (OpenAI, Anthropic, Google). For custom APIs or OAuth, use extensions. See [docs/models.md](docs/models.md) and [docs/custom-provider.md](docs/custom-provider.md).
 
+**Managed providers & models:** Start Pi with `--managed-config-url` to use a remote snapshot as the exclusive provider, model, and provider credential source. Managed mode does not merge built-ins, `models.json`, `auth.json`, provider credential environment variables, or extension-registered providers. See [docs/managed-config.md](docs/managed-config.md).
+
 ---
 
 ## Interactive Mode
@@ -559,6 +561,8 @@ cat README.md | pi -p "Summarize this text"
 | `--provider <name>` | Provider (anthropic, openai, google, etc.) |
 | `--model <pattern>` | Model pattern or ID (supports `provider/id` and optional `:<thinking>`) |
 | `--api-key <key>` | API key (overrides env vars) |
+| `--managed-config-url <url>` | Use only the remote managed provider and model snapshot |
+| `--managed-config-token <token>` | Bearer token used only to fetch managed configuration |
 | `--thinking <level>` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
 | `--models <patterns>` | Comma-separated patterns for Ctrl+P cycling |
 | `--list-models [search]` | List available models |
@@ -672,6 +676,8 @@ pi --thinking high "Solve this complex problem"
 | `PI_CODING_AGENT_DIR` | Override config directory (default: `~/.pi/agent`) |
 | `PI_CODING_AGENT_SESSION_DIR` | Override session storage directory (overridden by `--session-dir`) |
 | `PI_PACKAGE_DIR` | Override package directory (useful for Nix/Guix where store paths tokenize poorly) |
+| `PI_MANAGED_CONFIG_URL` | Enable managed mode with a remote provider and model snapshot |
+| `PI_MANAGED_CONFIG_TOKEN` | Bearer token used only to fetch managed configuration |
 | `PI_OFFLINE` | Disable startup network operations, including update checks, package update checks, and install/update telemetry |
 | `PI_SKIP_VERSION_CHECK` | Skip the Pi version update check at startup. This prevents the `pi.dev` latest-version request |
 | `PI_TELEMETRY` | Override install/update telemetry and provider attribution headers. Use `1`/`true`/`yes` to enable or `0`/`false`/`no` to disable. This does not disable update checks |

@@ -188,9 +188,13 @@ cat README.md | pi -p "Summarize this text"
 | `--provider <name>` | Provider, such as `anthropic`, `openai`, or `google` |
 | `--model <pattern>` | Model pattern or ID; supports `provider/id` and optional `:<thinking>` |
 | `--api-key <key>` | API key, overriding environment variables |
+| `--managed-config-url <url>` | Use only the remote managed provider and model snapshot |
+| `--managed-config-token <token>` | Bearer token used only to fetch managed configuration |
 | `--thinking <level>` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
 | `--models <patterns>` | Comma-separated patterns for Ctrl+P cycling |
 | `--list-models [search]` | List available models |
+
+See [Managed configuration](managed-config.md) for the remote schema, source isolation, startup behavior, and last-known-good cache semantics.
 
 ### Session Options
 

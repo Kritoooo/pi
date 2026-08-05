@@ -45,6 +45,7 @@ import { exportFromFile } from "./core/export-html/index.ts";
 import type { InlineExtension } from "./core/extensions/types.ts";
 import { applyHttpProxySettings, configureHttpDispatcher } from "./core/http-dispatcher.ts";
 import { resolveCliModel, resolveModelScope, type ScopedModel } from "./core/model-resolver.ts";
+import { ManagedConfigError, ManagedConfigResolver } from "./core/managed-config.ts";
 import { ModelRuntime } from "./core/model-runtime.ts";
 import { restoreStdout, takeOverStdout } from "./core/output-guard.ts";
 import { type AppMode, resolveProjectTrusted } from "./core/project-trust.ts";
@@ -69,6 +70,8 @@ import { isLocalPath, normalizePath, resolvePath } from "./utils/paths.ts";
 import { cleanupWindowsSelfUpdateQuarantine } from "./utils/windows-self-update.ts";
 
 const EXTENSION_LOAD_FAILURE_HINT = `Hint: Start without extensions using "${APP_NAME} -ne".`;
+const ENV_MANAGED_CONFIG_URL = "PI_MANAGED_CONFIG_URL";
+const ENV_MANAGED_CONFIG_TOKEN = "PI_MANAGED_CONFIG_TOKEN";
 
 /**
  * Read all content from piped stdin.
@@ -149,6 +152,16 @@ async function runAuthCommand(args: string[]): Promise<boolean> {
 		const option = parsed.unknownFlags.keys().next().value;
 		console.error(chalk.red(`Unknown option --${option} for "${getAuthCommandName(command.kind)}".`));
 		console.error(chalk.dim(`Use "${APP_NAME} --help" or "${getAuthCommandUsage(command.kind)}".`));
+		process.exitCode = 1;
+		return true;
+	}
+	if (parsed.managedConfigUrl ?? process.env[ENV_MANAGED_CONFIG_URL]) {
+		console.error(chalk.red("Error: Credential export is unavailable in managed mode"));
+		process.exitCode = 1;
+		return true;
+	}
+	if (parsed.managedConfigToken ?? process.env[ENV_MANAGED_CONFIG_TOKEN]) {
+		console.error(chalk.red("Error: Managed config token requires a managed config URL"));
 		process.exitCode = 1;
 		return true;
 	}
@@ -628,6 +641,36 @@ export async function main(args: string[], options?: MainOptions) {
 		process.exit(0);
 	}
 
+	const managedConfigUrl = parsed.managedConfigUrl ?? process.env[ENV_MANAGED_CONFIG_URL];
+	const managedConfigToken = parsed.managedConfigToken ?? process.env[ENV_MANAGED_CONFIG_TOKEN];
+	if (managedConfigToken !== undefined && managedConfigUrl === undefined) {
+		console.error(chalk.red("Error: Managed config token requires a managed config URL"));
+		process.exit(1);
+	}
+	if (managedConfigUrl !== undefined && parsed.apiKey !== undefined) {
+		console.error(chalk.red("Error: --api-key is unavailable in managed mode"));
+		process.exit(1);
+	}
+
+	let managedModelRuntime: ModelRuntime | undefined;
+	if (managedConfigUrl !== undefined) {
+		try {
+			const resolution = await new ManagedConfigResolver({
+				url: managedConfigUrl,
+				token: managedConfigToken,
+			}).resolve({ allowNetwork: !offlineMode, signal: AbortSignal.timeout(15_000) });
+			if (resolution.warning) console.error(chalk.yellow(`Warning: ${resolution.warning}`));
+			managedModelRuntime = await ModelRuntime.create({
+				managedConfig: resolution.snapshot,
+				signal: AbortSignal.timeout(15_000),
+			});
+		} catch (error) {
+			const message = error instanceof ManagedConfigError ? error.message : "Managed config initialization failed";
+			console.error(chalk.red(`Error: ${message}`));
+			process.exit(1);
+		}
+	}
+
 	let appMode = resolveAppMode(parsed, process.stdin.isTTY, process.stdout.isTTY);
 	const shouldTakeOverStdout = appMode !== "interactive" && !isPlainRuntimeMetadataCommand(parsed);
 	if (shouldTakeOverStdout) {
@@ -730,6 +773,7 @@ export async function main(args: string[], options?: MainOptions) {
 			cwd,
 			agentDir,
 			settingsManager: runtimeSettingsManager,
+			modelRuntime: managedModelRuntime,
 			modelRuntimeSignal: AbortSignal.timeout(15_000),
 			extensionFlagValues: parsed.unknownFlags,
 			resourceLoaderReloadOptions: shouldResolveProjectTrust

@@ -156,6 +156,13 @@ export async function createAgentSessionServices(
 	const diagnostics: AgentSessionRuntimeDiagnostic[] = [];
 	const extensionsResult = resourceLoader.getExtensions();
 	for (const { name, config, extensionPath } of extensionsResult.runtime.pendingProviderRegistrations) {
+		if (modelRuntime.isManaged()) {
+			diagnostics.push({
+				type: "warning",
+				message: `Extension "${extensionPath}" provider "${name}" was ignored in managed mode.`,
+			});
+			continue;
+		}
 		try {
 			modelRuntime.registerProvider(name, config);
 		} catch (error) {
@@ -168,6 +175,13 @@ export async function createAgentSessionServices(
 	}
 	extensionsResult.runtime.pendingProviderRegistrations = [];
 	for (const { provider, extensionPath } of extensionsResult.runtime.pendingNativeProviderRegistrations) {
+		if (modelRuntime.isManaged()) {
+			diagnostics.push({
+				type: "warning",
+				message: `Extension "${extensionPath}" provider "${provider.id}" was ignored in managed mode.`,
+			});
+			continue;
+		}
 		try {
 			modelRuntime.registerNativeProvider(provider);
 		} catch (error) {
