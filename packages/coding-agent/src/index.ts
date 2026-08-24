@@ -175,9 +175,18 @@ export {
 	ManagedConfigResolver,
 	type ManagedConfigResolverOptions,
 	type ManagedConfigSnapshot,
+	type ManagedContextFile,
+	type ManagedExtensionBundle,
+	type ManagedResourceFile,
+	type ManagedSettings,
+	type ManagedSkillBundle,
 	parseManagedConfig,
 	type ResolveManagedConfigOptions,
 } from "./core/managed-config.ts";
+export {
+	type MaterializedManagedResources,
+	materializeManagedResources,
+} from "./core/managed-resources.ts";
 export { convertToLlm } from "./core/messages.ts";
 export { ModelRegistry } from "./core/model-registry.ts";
 export {

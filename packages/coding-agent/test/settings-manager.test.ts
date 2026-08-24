@@ -199,6 +199,27 @@ describe("SettingsManager", () => {
 		});
 	});
 
+	describe("runtime overrides", () => {
+		it("stay above local settings across reloads and are not persisted", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(settingsPath, JSON.stringify({ theme: "local", compaction: { enabled: true } }));
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.applyRuntimeOverrides({ theme: "remote", compaction: { enabled: false } });
+
+			expect(manager.getTheme()).toBe("remote");
+			expect(manager.getCompactionEnabled()).toBe(false);
+			await manager.reload();
+			expect(manager.getTheme()).toBe("remote");
+			expect(manager.getCompactionEnabled()).toBe(false);
+
+			manager.setTheme("local-edit");
+			await manager.flush();
+			expect(manager.getTheme()).toBe("remote");
+			expect(JSON.parse(readFileSync(settingsPath, "utf-8")).theme).toBe("local-edit");
+		});
+	});
+
 	describe("theme setting", () => {
 		it("stores slash-separated automatic theme settings separately from fixed theme names", async () => {
 			const settingsPath = join(agentDir, "settings.json");

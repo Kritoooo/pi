@@ -18,13 +18,180 @@ import { type Static, type TSchema, Type } from "typebox";
 import { Compile } from "typebox/compile";
 import type { TLocalizedValidationError } from "typebox/error";
 import { getAgentDir } from "../config.ts";
+import { parseFrontmatter } from "../utils/frontmatter.ts";
 import { normalizePath } from "../utils/paths.ts";
 import { ModelDefinitionSchema, ProviderCompatSchema } from "./model-config.ts";
+import { resolveModelScopeFromModels } from "./model-resolver.ts";
 import { mergeCompat } from "./provider-composer.ts";
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_RESPONSE_BYTES = 1024 * 1024;
 const CACHE_VERSION = 1;
+const MAX_MANAGED_RESOURCE_BUNDLES = 64;
+const MAX_MANAGED_RESOURCE_FILES_PER_BUNDLE = 128;
+const MAX_MANAGED_RESOURCE_FILES = 512;
+const MAX_MANAGED_RESOURCE_NAME_LENGTH = 64;
+const MAX_MANAGED_RESOURCE_PATH_LENGTH = 240;
+
+const ThinkingLevelSchema = Type.Union([
+	Type.Literal("off"),
+	Type.Literal("minimal"),
+	Type.Literal("low"),
+	Type.Literal("medium"),
+	Type.Literal("high"),
+	Type.Literal("xhigh"),
+	Type.Literal("max"),
+]);
+
+const ManagedSettingsSchema = strictSchema(
+	Type.Partial(
+		Type.Object({
+			defaultProvider: Type.String({ minLength: 1 }),
+			defaultModel: Type.String({ minLength: 1 }),
+			defaultThinkingLevel: ThinkingLevelSchema,
+			modelThinkingLevels: Type.Record(Type.String({ minLength: 1 }), ThinkingLevelSchema),
+			transport: Type.Union([
+				Type.Literal("auto"),
+				Type.Literal("sse"),
+				Type.Literal("websocket"),
+				Type.Literal("websocket-cached"),
+			]),
+			steeringMode: Type.Union([Type.Literal("all"), Type.Literal("one-at-a-time")]),
+			followUpMode: Type.Union([Type.Literal("all"), Type.Literal("one-at-a-time")]),
+			compaction: Type.Partial(
+				Type.Object({
+					enabled: Type.Boolean(),
+					reserveTokens: Type.Integer({ minimum: 0 }),
+					keepRecentTokens: Type.Integer({ minimum: 0 }),
+				}),
+			),
+			branchSummary: Type.Partial(
+				Type.Object({
+					reserveTokens: Type.Integer({ minimum: 0 }),
+					skipPrompt: Type.Boolean(),
+				}),
+			),
+			retry: Type.Partial(
+				Type.Object({
+					enabled: Type.Boolean(),
+					maxRetries: Type.Integer({ minimum: 0 }),
+					baseDelayMs: Type.Integer({ minimum: 0 }),
+					provider: Type.Optional(
+						Type.Partial(
+							Type.Object({
+								timeoutMs: Type.Integer({ minimum: 0 }),
+								maxRetries: Type.Integer({ minimum: 0 }),
+								maxRetryDelayMs: Type.Integer({ minimum: 0 }),
+							}),
+						),
+					),
+				}),
+			),
+			hideThinkingBlock: Type.Boolean(),
+			showCacheMissNotices: Type.Boolean(),
+			quietStartup: Type.Boolean(),
+			collapseChangelog: Type.Boolean(),
+			enableInstallTelemetry: Type.Boolean(),
+			enableAnalytics: Type.Boolean(),
+			enableSkillCommands: Type.Boolean(),
+			theme: Type.String({ minLength: 1 }),
+			terminal: Type.Partial(
+				Type.Object({
+					showImages: Type.Boolean(),
+					imageWidthCells: Type.Integer({ minimum: 1 }),
+					clearOnShrink: Type.Boolean(),
+					showTerminalProgress: Type.Boolean(),
+				}),
+			),
+			images: Type.Partial(
+				Type.Object({
+					autoResize: Type.Boolean(),
+					blockImages: Type.Boolean(),
+				}),
+			),
+			enabledModels: Type.Array(Type.String({ minLength: 1 })),
+			defaultTools: Type.Array(Type.String({ minLength: 1 })),
+			doubleEscapeAction: Type.Union([Type.Literal("fork"), Type.Literal("tree"), Type.Literal("none")]),
+			treeFilterMode: Type.Union([
+				Type.Literal("default"),
+				Type.Literal("no-tools"),
+				Type.Literal("user-only"),
+				Type.Literal("labeled-only"),
+				Type.Literal("all"),
+			]),
+			thinkingBudgets: Type.Partial(
+				Type.Object({
+					minimal: Type.Integer({ minimum: 0 }),
+					low: Type.Integer({ minimum: 0 }),
+					medium: Type.Integer({ minimum: 0 }),
+					high: Type.Integer({ minimum: 0 }),
+				}),
+			),
+			editorPaddingX: Type.Integer({ minimum: 0, maximum: 3 }),
+			outputPad: Type.Union([Type.Literal(0), Type.Literal(1)]),
+			autocompleteMaxVisible: Type.Integer({ minimum: 3, maximum: 20 }),
+			showHardwareCursor: Type.Boolean(),
+			markdown: Type.Partial(
+				Type.Object({
+					codeBlockIndent: Type.String(),
+					mermaid: Type.Union([Type.Literal("off"), Type.Literal("final"), Type.Literal("streaming")]),
+				}),
+			),
+			warnings: Type.Partial(Type.Object({ anthropicExtraUsage: Type.Boolean() })),
+			tuiMode: Type.Union([Type.Literal("regular"), Type.Literal("fullscreen")]),
+			fullscreenExitOutput: Type.Union([Type.Literal("transcript"), Type.Literal("resume-hint")]),
+			fullscreenScrollbar: Type.Union([Type.Literal("auto"), Type.Literal("always"), Type.Literal("hidden")]),
+			httpIdleTimeoutMs: Type.Integer({ minimum: 0 }),
+			websocketConnectTimeoutMs: Type.Integer({ minimum: 0 }),
+		}),
+	),
+);
+
+const ManagedContextFileSchema = Type.Object(
+	{
+		path: Type.String({ minLength: 1 }),
+		content: Type.String(),
+	},
+	{ additionalProperties: false },
+);
+
+const ManagedResourceFileSchema = Type.Object(
+	{
+		path: Type.String({ minLength: 1, maxLength: MAX_MANAGED_RESOURCE_PATH_LENGTH }),
+		content: Type.String(),
+		executable: Type.Optional(Type.Boolean()),
+	},
+	{ additionalProperties: false },
+);
+
+const ManagedResourceNameSchema = Type.String({
+	minLength: 1,
+	maxLength: MAX_MANAGED_RESOURCE_NAME_LENGTH,
+	pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+});
+
+const ManagedSkillBundleSchema = Type.Object(
+	{
+		name: ManagedResourceNameSchema,
+		files: Type.Array(ManagedResourceFileSchema, {
+			minItems: 1,
+			maxItems: MAX_MANAGED_RESOURCE_FILES_PER_BUNDLE,
+		}),
+	},
+	{ additionalProperties: false },
+);
+
+const ManagedExtensionBundleSchema = Type.Object(
+	{
+		name: ManagedResourceNameSchema,
+		entry: Type.String({ minLength: 1, maxLength: MAX_MANAGED_RESOURCE_PATH_LENGTH }),
+		files: Type.Array(ManagedResourceFileSchema, {
+			minItems: 1,
+			maxItems: MAX_MANAGED_RESOURCE_FILES_PER_BUNDLE,
+		}),
+	},
+	{ additionalProperties: false },
+);
 
 function strictSchema<T extends TSchema>(schema: T): T {
 	const clone = structuredClone(schema) as T;
@@ -62,6 +229,12 @@ const ManagedConfigSchema = Type.Object(
 	{
 		version: Type.Literal(1),
 		providers: Type.Array(ManagedProviderSchema, { minItems: 1 }),
+		settings: ManagedSettingsSchema,
+		systemPrompt: Type.Union([Type.String(), Type.Null()]),
+		appendSystemPrompt: Type.Array(Type.String()),
+		contextFiles: Type.Array(ManagedContextFileSchema),
+		skills: Type.Array(ManagedSkillBundleSchema, { maxItems: MAX_MANAGED_RESOURCE_BUNDLES }),
+		extensions: Type.Array(ManagedExtensionBundleSchema, { maxItems: MAX_MANAGED_RESOURCE_BUNDLES }),
 	},
 	{ additionalProperties: false },
 );
@@ -79,6 +252,11 @@ const validateManagedConfigCache = Compile(ManagedConfigCacheSchema);
 
 export type ManagedConfigSnapshot = Static<typeof ManagedConfigSchema>;
 export type ManagedConfigProvider = Static<typeof ManagedProviderSchema>;
+export type ManagedSettings = Static<typeof ManagedSettingsSchema>;
+export type ManagedContextFile = Static<typeof ManagedContextFileSchema>;
+export type ManagedResourceFile = Static<typeof ManagedResourceFileSchema>;
+export type ManagedSkillBundle = Static<typeof ManagedSkillBundleSchema>;
+export type ManagedExtensionBundle = Static<typeof ManagedExtensionBundleSchema>;
 
 export type ManagedConfigErrorCode =
 	| "aborted"
@@ -86,6 +264,7 @@ export type ManagedConfigErrorCode =
 	| "http"
 	| "json"
 	| "request"
+	| "resources"
 	| "response_too_large"
 	| "schema"
 	| "timeout"
@@ -93,11 +272,13 @@ export type ManagedConfigErrorCode =
 
 export class ManagedConfigError extends Error {
 	readonly code: ManagedConfigErrorCode;
+	readonly cacheFallbackAllowed: boolean;
 
-	constructor(code: ManagedConfigErrorCode, message: string) {
+	constructor(code: ManagedConfigErrorCode, message: string, options: { cacheFallbackAllowed?: boolean } = {}) {
 		super(message);
 		this.name = "ManagedConfigError";
 		this.code = code;
+		this.cacheFallbackAllowed = options.cacheFallbackAllowed ?? false;
 	}
 }
 
@@ -219,6 +400,193 @@ function deepFreeze<T>(value: T): T {
 	return Object.freeze(value);
 }
 
+function assertManagedResourceName(value: string, path: string): void {
+	if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(value)) {
+		throw validationError(path, "must contain lowercase letters, digits, and single hyphens only");
+	}
+	if (/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/iu.test(value)) {
+		throw validationError(path, "must not use a reserved filesystem name");
+	}
+}
+
+function assertManagedResourcePath(value: string, path: string): void {
+	if (value !== value.trim() || /[\u0000-\u001f\u007f]/u.test(value)) {
+		throw validationError(path, "must not contain surrounding whitespace or control characters");
+	}
+	if (!/^[A-Za-z0-9._/-]+$/u.test(value) || value.startsWith("/") || value.includes("\\")) {
+		throw validationError(path, "must be a portable relative POSIX path");
+	}
+
+	const segments = value.split("/");
+	for (const segment of segments) {
+		if (segment === "" || segment === "." || segment === "..") {
+			throw validationError(path, "must not contain empty, '.' or '..' segments");
+		}
+		if (segment.endsWith(".") || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu.test(segment)) {
+			throw validationError(path, `contains reserved filesystem segment "${segment}"`);
+		}
+	}
+}
+
+function assertManagedResourceFiles(
+	files: readonly ManagedResourceFile[],
+	path: string,
+): Map<string, ManagedResourceFile> {
+	const filesByPath = new Map<string, ManagedResourceFile>();
+	const normalizedPaths = new Map<string, string>();
+	for (const [index, file] of files.entries()) {
+		const filePath = `${path}.${index}.path`;
+		assertManagedResourcePath(file.path, filePath);
+		const normalizedPath = file.path.toLowerCase();
+		const duplicate = normalizedPaths.get(normalizedPath);
+		if (duplicate !== undefined) {
+			throw validationError(filePath, `duplicates managed resource path "${duplicate}"`);
+		}
+		for (const [existingNormalizedPath, existingPath] of normalizedPaths) {
+			if (
+				normalizedPath.startsWith(`${existingNormalizedPath}/`) ||
+				existingNormalizedPath.startsWith(`${normalizedPath}/`)
+			) {
+				throw validationError(filePath, `conflicts with managed resource path "${existingPath}"`);
+			}
+		}
+		normalizedPaths.set(normalizedPath, file.path);
+		filesByPath.set(file.path, file);
+	}
+	return filesByPath;
+}
+
+function assertManagedSkillBundle(bundle: ManagedSkillBundle, index: number): void {
+	const bundlePath = `skills.${index}`;
+	assertManagedResourceName(bundle.name, `${bundlePath}.name`);
+	const filesByPath = assertManagedResourceFiles(bundle.files, `${bundlePath}.files`);
+	const skillFile = filesByPath.get("SKILL.md");
+	if (!skillFile) {
+		throw validationError(`${bundlePath}.files`, 'must contain a root "SKILL.md" file');
+	}
+
+	let frontmatter: {
+		name?: unknown;
+		description?: unknown;
+		"disable-model-invocation"?: unknown;
+	};
+	try {
+		({ frontmatter } = parseFrontmatter(skillFile.content));
+	} catch {
+		throw validationError(`${bundlePath}.files`, 'root "SKILL.md" must contain valid frontmatter');
+	}
+	if (frontmatter.name !== undefined && frontmatter.name !== bundle.name) {
+		throw validationError(`${bundlePath}.files`, 'root "SKILL.md" name must match the bundle name');
+	}
+	if (typeof frontmatter.description !== "string" || frontmatter.description.trim().length === 0) {
+		throw validationError(`${bundlePath}.files`, 'root "SKILL.md" description is required');
+	}
+	if (frontmatter.description.length > 1024) {
+		throw validationError(`${bundlePath}.files`, 'root "SKILL.md" description exceeds 1024 characters');
+	}
+	if (
+		frontmatter["disable-model-invocation"] !== undefined &&
+		typeof frontmatter["disable-model-invocation"] !== "boolean"
+	) {
+		throw validationError(`${bundlePath}.files`, 'root "SKILL.md" disable-model-invocation must be boolean');
+	}
+}
+
+function assertManagedExtensionBundle(bundle: ManagedExtensionBundle, index: number): void {
+	const bundlePath = `extensions.${index}`;
+	assertManagedResourceName(bundle.name, `${bundlePath}.name`);
+	assertManagedResourcePath(bundle.entry, `${bundlePath}.entry`);
+	const filesByPath = assertManagedResourceFiles(bundle.files, `${bundlePath}.files`);
+	if (!filesByPath.has(bundle.entry)) {
+		throw validationError(`${bundlePath}.entry`, "must identify a file in the extension bundle");
+	}
+	if (!bundle.entry.endsWith(".ts") && !bundle.entry.endsWith(".js")) {
+		throw validationError(`${bundlePath}.entry`, 'must end with ".ts" or ".js"');
+	}
+}
+
+function assertManagedResourceBundles(config: ManagedConfigSnapshot): void {
+	let fileCount = 0;
+	const skillNames = new Set<string>();
+	for (const [index, bundle] of config.skills.entries()) {
+		const normalizedName = bundle.name.toLowerCase();
+		if (skillNames.has(normalizedName)) {
+			throw validationError(`skills.${index}.name`, `duplicate managed skill name "${bundle.name}"`);
+		}
+		skillNames.add(normalizedName);
+		fileCount += bundle.files.length;
+		assertManagedSkillBundle(bundle, index);
+	}
+
+	const extensionNames = new Set<string>();
+	for (const [index, bundle] of config.extensions.entries()) {
+		const normalizedName = bundle.name.toLowerCase();
+		if (extensionNames.has(normalizedName)) {
+			throw validationError(`extensions.${index}.name`, `duplicate managed extension name "${bundle.name}"`);
+		}
+		extensionNames.add(normalizedName);
+		fileCount += bundle.files.length;
+		assertManagedExtensionBundle(bundle, index);
+	}
+
+	if (fileCount > MAX_MANAGED_RESOURCE_FILES) {
+		throw validationError("root", `managed resources exceed the ${MAX_MANAGED_RESOURCE_FILES}-file limit`);
+	}
+}
+
+function hasManagedModel(config: ManagedConfigSnapshot, providerId: string, modelId: string): boolean {
+	return config.providers.some(
+		(provider) => provider.id === providerId && provider.models.some((model) => model.id === modelId),
+	);
+}
+
+function assertManagedSettingsReferences(config: ManagedConfigSnapshot): void {
+	const { defaultProvider, defaultModel, modelThinkingLevels, enabledModels } = config.settings;
+	if (defaultProvider === undefined && defaultModel !== undefined) {
+		throw validationError("settings.defaultProvider", "is required when settings.defaultModel is configured");
+	}
+	if (defaultProvider !== undefined && defaultModel === undefined) {
+		throw validationError("settings.defaultModel", "is required when settings.defaultProvider is configured");
+	}
+	if (defaultProvider !== undefined && defaultModel !== undefined) {
+		const provider = config.providers.find((entry) => entry.id === defaultProvider);
+		if (!provider) {
+			throw validationError("settings.defaultProvider", `unknown managed provider "${defaultProvider}"`);
+		}
+		if (!provider.models.some((model) => model.id === defaultModel)) {
+			throw validationError("settings.defaultModel", `unknown managed model "${defaultProvider}/${defaultModel}"`);
+		}
+	}
+
+	for (const modelReference of Object.keys(modelThinkingLevels ?? {})) {
+		const slashIndex = modelReference.indexOf("/");
+		if (slashIndex <= 0 || slashIndex === modelReference.length - 1) {
+			throw validationError(
+				`settings.modelThinkingLevels.${modelReference}`,
+				'must use the exact "provider/model" form',
+			);
+		}
+		const providerId = modelReference.slice(0, slashIndex);
+		const modelId = modelReference.slice(slashIndex + 1);
+		if (!hasManagedModel(config, providerId, modelId)) {
+			throw validationError(
+				`settings.modelThinkingLevels.${modelReference}`,
+				`unknown managed model "${modelReference}"`,
+			);
+		}
+	}
+
+	if (enabledModels) {
+		const models = config.providers.flatMap((provider) => managedModels(provider));
+		for (const [index, pattern] of enabledModels.entries()) {
+			const diagnostic = resolveModelScopeFromModels([pattern], models).diagnostics[0];
+			if (diagnostic) {
+				throw validationError(`settings.enabledModels.${index}`, diagnostic.message);
+			}
+		}
+	}
+}
+
 export function parseManagedConfig(input: unknown): ManagedConfigSnapshot {
 	if (!validateManagedConfig.Check(input)) {
 		const first = validateManagedConfig.Errors(input)[0];
@@ -270,6 +638,21 @@ export function parseManagedConfig(input: unknown): ManagedConfigSnapshot {
 		}
 	}
 
+	const contextPaths = new Set<string>();
+	for (const [index, contextFile] of config.contextFiles.entries()) {
+		const path = `contextFiles.${index}.path`;
+		if (contextFile.path.trim().length === 0 || /[\u0000-\u001f\u007f]/u.test(contextFile.path)) {
+			throw validationError(path, "must not be blank or contain control characters");
+		}
+		if (contextPaths.has(contextFile.path)) {
+			throw validationError(path, `duplicate context file path "${contextFile.path}"`);
+		}
+		contextPaths.add(contextFile.path);
+	}
+
+	assertManagedSettingsReferences(config);
+	assertManagedResourceBundles(config);
+
 	return deepFreeze(structuredClone(config));
 }
 
@@ -313,7 +696,9 @@ export class ManagedConfigResolver {
 	async resolve(options: ResolveManagedConfigOptions = {}): Promise<ManagedConfigResolution> {
 		let remoteError: ManagedConfigError;
 		if (options.allowNetwork === false) {
-			remoteError = new ManagedConfigError("request", "Managed config network access is disabled");
+			remoteError = new ManagedConfigError("request", "Managed config network access is disabled", {
+				cacheFallbackAllowed: true,
+			});
 		} else {
 			try {
 				const snapshot = await this.fetchSnapshot(options.signal);
@@ -331,9 +716,12 @@ export class ManagedConfigResolver {
 				remoteError =
 					error instanceof ManagedConfigError
 						? error
-						: new ManagedConfigError("request", `Managed config request failed for ${displayUrl(this.url)}`);
+						: new ManagedConfigError("request", `Managed config request failed for ${displayUrl(this.url)}`, {
+								cacheFallbackAllowed: true,
+							});
 			}
 		}
+		if (!remoteError.cacheFallbackAllowed) throw remoteError;
 
 		try {
 			const snapshot = await this.readCache();
@@ -373,9 +761,12 @@ export class ManagedConfigResolver {
 				throw new ManagedConfigError(
 					"timeout",
 					`Managed config request timed out after ${this.timeoutMs}ms for ${displayUrl(this.url)}`,
+					{ cacheFallbackAllowed: true },
 				);
 			}
-			throw new ManagedConfigError("request", `Managed config request failed for ${displayUrl(this.url)}`);
+			throw new ManagedConfigError("request", `Managed config request failed for ${displayUrl(this.url)}`, {
+				cacheFallbackAllowed: true,
+			});
 		}
 
 		if (!response.ok) {
@@ -383,6 +774,13 @@ export class ManagedConfigResolver {
 			throw new ManagedConfigError(
 				"http",
 				`Managed config request returned HTTP ${response.status} for ${displayUrl(this.url)}`,
+				{
+					cacheFallbackAllowed:
+						response.status === 408 ||
+						response.status === 425 ||
+						response.status === 429 ||
+						response.status >= 500,
+				},
 			);
 		}
 
@@ -398,9 +796,12 @@ export class ManagedConfigResolver {
 				throw new ManagedConfigError(
 					"timeout",
 					`Managed config request timed out after ${this.timeoutMs}ms for ${displayUrl(this.url)}`,
+					{ cacheFallbackAllowed: true },
 				);
 			}
-			throw new ManagedConfigError("request", `Managed config response failed for ${displayUrl(this.url)}`);
+			throw new ManagedConfigError("request", `Managed config response failed for ${displayUrl(this.url)}`, {
+				cacheFallbackAllowed: true,
+			});
 		}
 		let parsed: unknown;
 		try {

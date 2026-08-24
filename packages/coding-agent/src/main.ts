@@ -44,8 +44,10 @@ import { AuthStorage, ReadOnlyAuthStorage } from "./core/auth-storage.ts";
 import { exportFromFile } from "./core/export-html/index.ts";
 import type { InlineExtension } from "./core/extensions/types.ts";
 import { applyHttpProxySettings, configureHttpDispatcher } from "./core/http-dispatcher.ts";
+import { setUserKeybindingsEnabled } from "./core/keybindings.ts";
+import { ManagedConfigError, ManagedConfigResolver, type ManagedConfigSnapshot } from "./core/managed-config.ts";
+import { type MaterializedManagedResources, materializeManagedResources } from "./core/managed-resources.ts";
 import { resolveCliModel, resolveModelScope, type ScopedModel } from "./core/model-resolver.ts";
-import { ManagedConfigError, ManagedConfigResolver } from "./core/managed-config.ts";
 import { ModelRuntime } from "./core/model-runtime.ts";
 import { restoreStdout, takeOverStdout } from "./core/output-guard.ts";
 import { type AppMode, resolveProjectTrusted } from "./core/project-trust.ts";
@@ -72,6 +74,7 @@ import { cleanupWindowsSelfUpdateQuarantine } from "./utils/windows-self-update.
 const EXTENSION_LOAD_FAILURE_HINT = `Hint: Start without extensions using "${APP_NAME} -ne".`;
 const ENV_MANAGED_CONFIG_URL = "PI_MANAGED_CONFIG_URL";
 const ENV_MANAGED_CONFIG_TOKEN = "PI_MANAGED_CONFIG_TOKEN";
+const ENV_MANAGED_CONFIG_DISABLED = "PI_MANAGED_CONFIG_DISABLED";
 
 /**
  * Read all content from piped stdin.
@@ -107,6 +110,17 @@ function reportDiagnostics(diagnostics: readonly AgentSessionRuntimeDiagnostic[]
 function isTruthyEnvFlag(value: string | undefined): boolean {
 	if (!value) return false;
 	return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
+}
+
+function createSettingsManager(
+	cwd: string,
+	agentDir: string,
+	snapshot: ManagedConfigSnapshot | undefined,
+	projectTrusted = true,
+): SettingsManager {
+	return snapshot
+		? SettingsManager.createManaged(cwd, agentDir, snapshot.settings, { projectTrusted })
+		: SettingsManager.create(cwd, agentDir, { projectTrusted });
 }
 
 function resolveAppMode(parsed: Args, stdinIsTTY: boolean, stdoutIsTTY: boolean): AppMode {
@@ -571,6 +585,7 @@ export interface MainOptions {
 }
 
 export async function main(args: string[], options?: MainOptions) {
+	setUserKeybindingsEnabled(true);
 	resetTimings();
 	const extensionFactories = [...builtInExtensions, ...(options?.extensionFactories ?? [])];
 	const offlineMode = args.includes("--offline") || isTruthyEnvFlag(process.env.PI_OFFLINE);
@@ -641,9 +656,13 @@ export async function main(args: string[], options?: MainOptions) {
 		process.exit(0);
 	}
 
-	const managedConfigUrl = parsed.managedConfigUrl ?? process.env[ENV_MANAGED_CONFIG_URL];
+	const managedConfigDisabled =
+		parsed.noManagedConfig === true || isTruthyEnvFlag(process.env[ENV_MANAGED_CONFIG_DISABLED]);
+	const managedConfigUrl = managedConfigDisabled
+		? undefined
+		: (parsed.managedConfigUrl ?? process.env[ENV_MANAGED_CONFIG_URL]);
 	const managedConfigToken = parsed.managedConfigToken ?? process.env[ENV_MANAGED_CONFIG_TOKEN];
-	if (managedConfigToken !== undefined && managedConfigUrl === undefined) {
+	if (!managedConfigDisabled && managedConfigToken !== undefined && managedConfigUrl === undefined) {
 		console.error(chalk.red("Error: Managed config token requires a managed config URL"));
 		process.exit(1);
 	}
@@ -653,6 +672,8 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 
 	let managedModelRuntime: ModelRuntime | undefined;
+	let managedConfigSnapshot: ManagedConfigSnapshot | undefined;
+	let managedResources: MaterializedManagedResources | undefined;
 	if (managedConfigUrl !== undefined) {
 		try {
 			const resolution = await new ManagedConfigResolver({
@@ -660,6 +681,8 @@ export async function main(args: string[], options?: MainOptions) {
 				token: managedConfigToken,
 			}).resolve({ allowNetwork: !offlineMode, signal: AbortSignal.timeout(15_000) });
 			if (resolution.warning) console.error(chalk.yellow(`Warning: ${resolution.warning}`));
+			managedConfigSnapshot = resolution.snapshot;
+			managedResources = await materializeManagedResources(resolution.snapshot, agentDir);
 			managedModelRuntime = await ModelRuntime.create({
 				managedConfig: resolution.snapshot,
 				signal: AbortSignal.timeout(15_000),
@@ -670,6 +693,8 @@ export async function main(args: string[], options?: MainOptions) {
 			process.exit(1);
 		}
 	}
+	const managedMode = managedConfigSnapshot !== undefined;
+	setUserKeybindingsEnabled(!managedMode);
 
 	let appMode = resolveAppMode(parsed, process.stdin.isTTY, process.stdout.isTTY);
 	const shouldTakeOverStdout = appMode !== "interactive" && !isPlainRuntimeMetadataCommand(parsed);
@@ -689,12 +714,18 @@ export async function main(args: string[], options?: MainOptions) {
 	const { migratedAuthProviders: migratedProviders, deprecationWarnings } = runMigrations(cwd);
 	time("runMigrations");
 
-	const startupSettingsManager = SettingsManager.create(cwd, agentDir);
+	const startupSettingsManager = createSettingsManager(cwd, agentDir, managedConfigSnapshot);
 	const startupSettingsDiagnostics = collectSettingsDiagnostics(startupSettingsManager);
 
 	// Experimental first-time setup: theme choice and analytics opt-in.
 	// Runs before any runtime services are created so the chosen settings apply everywhere.
-	if (appMode === "interactive" && !parsed.help && parsed.listModels === undefined && shouldRunFirstTimeSetup()) {
+	if (
+		!managedMode &&
+		appMode === "interactive" &&
+		!parsed.help &&
+		parsed.listModels === undefined &&
+		shouldRunFirstTimeSetup()
+	) {
 		await showFirstTimeSetup(startupSettingsManager);
 		time("firstTimeSetup");
 	}
@@ -740,7 +771,7 @@ export async function main(args: string[], options?: MainOptions) {
 	const trustStore = new ProjectTrustStore(agentDir);
 	const sessionCwd = sessionManager.getCwd();
 	const autoTrustOnReloadCwd =
-		parsed.projectTrustOverride === undefined && !hasTrustRequiringProjectResources(sessionCwd)
+		parsed.projectTrustOverride === undefined && (managedMode || !hasTrustRequiringProjectResources(sessionCwd))
 			? sessionCwd
 			: undefined;
 	const trustPromptMode: AppMode = parsed.help || parsed.listModels !== undefined ? "print" : appMode;
@@ -760,7 +791,7 @@ export async function main(args: string[], options?: MainOptions) {
 		const isInitialRuntime = sessionStartEvent === undefined;
 		const projectTrustDiagnostics: AgentSessionRuntimeDiagnostic[] = [];
 		const cachedProjectTrust = projectTrustByCwd.get(cwd);
-		const hasTrustRequiringResources = hasTrustRequiringProjectResources(cwd);
+		const hasTrustRequiringResources = !managedMode && hasTrustRequiringProjectResources(cwd);
 		const shouldResolveProjectTrust =
 			parsed.projectTrustOverride === undefined && cachedProjectTrust === undefined && hasTrustRequiringResources;
 		const projectTrusted = shouldResolveProjectTrust
@@ -768,7 +799,10 @@ export async function main(args: string[], options?: MainOptions) {
 			: (cachedProjectTrust ??
 				parsed.projectTrustOverride ??
 				(!hasTrustRequiringResources || trustStore.get(cwd) === true));
-		const runtimeSettingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted });
+		const runtimeSettingsManager = createSettingsManager(cwd, agentDir, managedConfigSnapshot, projectTrusted);
+		const managedSystemPrompt = managedConfigSnapshot?.systemPrompt ?? undefined;
+		const managedAppendSystemPrompt = managedConfigSnapshot?.appendSystemPrompt ?? [];
+		const managedContextFiles = parsed.noContextFiles ? [] : (managedConfigSnapshot?.contextFiles ?? []);
 		const services = await createAgentSessionServices({
 			cwd,
 			agentDir,
@@ -803,6 +837,9 @@ export async function main(args: string[], options?: MainOptions) {
 			resourceLoaderOptions: {
 				additionalExtensionPaths: resolvedExtensionPaths,
 				additionalSkillPaths: resolvedSkillPaths,
+				managedExtensionPaths: managedResources?.extensionPaths,
+				managedSkillPaths: managedResources?.skillPaths,
+				managedMode,
 				additionalPromptTemplatePaths: resolvedPromptTemplatePaths,
 				additionalThemePaths: resolvedThemePaths,
 				noExtensions: parsed.noExtensions,
@@ -812,6 +849,17 @@ export async function main(args: string[], options?: MainOptions) {
 				noContextFiles: parsed.noContextFiles,
 				systemPrompt: parsed.systemPrompt,
 				appendSystemPrompt: parsed.appendSystemPrompt,
+				systemPromptOverride:
+					parsed.systemPrompt === undefined && managedMode ? () => managedSystemPrompt : undefined,
+				appendSystemPromptOverride:
+					parsed.appendSystemPrompt === undefined && managedMode
+						? () => [...managedAppendSystemPrompt]
+						: undefined,
+				agentsFilesOverride: managedMode
+					? () => ({
+							agentsFiles: managedContextFiles.map((file) => ({ path: file.path, content: file.content })),
+						})
+					: undefined,
 				extensionFactories,
 			},
 		});

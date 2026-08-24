@@ -184,6 +184,7 @@ export type SettingsScope = "global" | "project";
 
 export interface SettingsManagerCreateOptions {
 	projectTrusted?: boolean;
+	managedMode?: boolean;
 }
 
 export interface SettingsStorage {
@@ -197,6 +198,32 @@ export interface SettingsError {
 }
 
 type SettingsPaths = Partial<Record<SettingsScope, string>>;
+
+const MANAGED_MODE_LOCAL_SETTING_KEYS = new Set<keyof Settings>([
+	"lastChangelogVersion",
+	"externalEditor",
+	"shellPath",
+	"defaultProjectTrust",
+	"shellCommandPrefix",
+	"npmCommand",
+	"trackingId",
+	"sessionDir",
+	"httpProxy",
+]);
+
+function filterLoadedSettings(settings: Settings, scope: SettingsScope, managedMode: boolean): Settings {
+	if (!managedMode) return settings;
+	if (scope === "project") return {};
+
+	const filtered: Settings = {};
+	for (const key of MANAGED_MODE_LOCAL_SETTING_KEYS) {
+		const value = settings[key];
+		if (value !== undefined) {
+			(filtered as Record<keyof Settings, Settings[keyof Settings]>)[key] = value;
+		}
+	}
+	return filtered;
+}
 
 function toSettingsError(scope: SettingsScope, error: unknown, path?: string): SettingsError {
 	return {
@@ -296,8 +323,10 @@ export class SettingsManager {
 	private storage: SettingsStorage;
 	private globalSettings: Settings;
 	private projectSettings: Settings;
-	private settings: Settings;
+	private settings: Settings = {};
+	private runtimeOverrides: Settings = {};
 	private projectTrusted: boolean;
+	private managedMode: boolean;
 	private modifiedFields = new Set<keyof Settings>(); // Track global fields modified during session
 	private modifiedNestedFields = new Map<keyof Settings, Set<string>>(); // Track global nested field modifications
 	private modifiedProjectFields = new Set<keyof Settings>(); // Track project fields modified during session
@@ -317,16 +346,28 @@ export class SettingsManager {
 		initialErrors: SettingsError[] = [],
 		projectTrusted = true,
 		settingsPaths: SettingsPaths = {},
+		managedMode = false,
 	) {
 		this.storage = storage;
 		this.globalSettings = initialGlobal;
 		this.projectSettings = initialProject;
 		this.projectTrusted = projectTrusted;
+		this.managedMode = managedMode;
 		this.globalSettingsLoadError = globalLoadError;
 		this.projectSettingsLoadError = projectLoadError;
 		this.errors = [...initialErrors];
 		this.settingsPaths = settingsPaths;
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		this.recomputeEffectiveSettings();
+	}
+
+	private recomputeEffectiveSettings(): void {
+		this.settings = deepMergeSettings(
+			deepMergeSettings(
+				filterLoadedSettings(this.globalSettings, "global", this.managedMode),
+				filterLoadedSettings(this.projectSettings, "project", this.managedMode),
+			),
+			this.runtimeOverrides,
+		);
 	}
 
 	/** Create a SettingsManager that loads from files */
@@ -344,6 +385,18 @@ export class SettingsManager {
 		});
 	}
 
+	/** Create a file-backed manager that exposes only local machine state plus managed runtime settings. */
+	static createManaged(
+		cwd: string,
+		agentDir: string,
+		settings: Partial<Settings>,
+		options: SettingsManagerCreateOptions = {},
+	): SettingsManager {
+		const manager = SettingsManager.create(cwd, agentDir, { ...options, managedMode: true });
+		manager.applyRuntimeOverrides(settings);
+		return manager;
+	}
+
 	/** Create a SettingsManager from an arbitrary storage backend */
 	static fromStorage(storage: SettingsStorage, options: SettingsManagerCreateOptions = {}): SettingsManager {
 		return SettingsManager.fromStorageWithPaths(storage, options);
@@ -356,8 +409,9 @@ export class SettingsManager {
 		settingsPaths: SettingsPaths = {},
 	): SettingsManager {
 		const projectTrusted = options.projectTrusted ?? true;
-		const globalLoad = SettingsManager.tryLoadFromStorage(storage, "global");
-		const projectLoad = SettingsManager.tryLoadFromStorage(storage, "project", projectTrusted);
+		const managedMode = options.managedMode ?? false;
+		const globalLoad = SettingsManager.tryLoadFromStorage(storage, "global", true, managedMode);
+		const projectLoad = SettingsManager.tryLoadFromStorage(storage, "project", projectTrusted, managedMode);
 		const initialErrors: SettingsError[] = [];
 		if (globalLoad.error) {
 			initialErrors.push(toSettingsError("global", globalLoad.error, settingsPaths.global));
@@ -375,6 +429,7 @@ export class SettingsManager {
 			initialErrors,
 			projectTrusted,
 			settingsPaths,
+			managedMode,
 		);
 	}
 
@@ -408,9 +463,20 @@ export class SettingsManager {
 		storage: SettingsStorage,
 		scope: SettingsScope,
 		projectTrusted = true,
+		managedMode = false,
 	): { settings: Settings; error: Error | null } {
+		if (managedMode && scope === "project") {
+			return { settings: {}, error: null };
+		}
 		try {
-			return { settings: SettingsManager.loadFromStorage(storage, scope, projectTrusted), error: null };
+			return {
+				settings: filterLoadedSettings(
+					SettingsManager.loadFromStorage(storage, scope, projectTrusted),
+					scope,
+					managedMode,
+				),
+				error: null,
+			};
 		} catch (error) {
 			return { settings: {}, error: error as Error };
 		}
@@ -490,6 +556,10 @@ export class SettingsManager {
 		return this.projectTrusted;
 	}
 
+	isManagedMode(): boolean {
+		return this.managedMode;
+	}
+
 	setProjectTrusted(trusted: boolean): void {
 		if (this.projectTrusted === trusted) {
 			return;
@@ -502,22 +572,22 @@ export class SettingsManager {
 		if (!trusted) {
 			this.projectSettings = {};
 			this.projectSettingsLoadError = null;
-			this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+			this.recomputeEffectiveSettings();
 			return;
 		}
 
-		const projectLoad = SettingsManager.tryLoadFromStorage(this.storage, "project", trusted);
+		const projectLoad = SettingsManager.tryLoadFromStorage(this.storage, "project", trusted, this.managedMode);
 		this.projectSettings = projectLoad.settings;
 		this.projectSettingsLoadError = projectLoad.error;
 		if (projectLoad.error) {
 			this.recordError("project", projectLoad.error);
 		}
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		this.recomputeEffectiveSettings();
 	}
 
 	async reload(): Promise<void> {
 		await this.writeQueue;
-		const globalLoad = SettingsManager.tryLoadFromStorage(this.storage, "global");
+		const globalLoad = SettingsManager.tryLoadFromStorage(this.storage, "global", true, this.managedMode);
 		if (!globalLoad.error) {
 			this.globalSettings = globalLoad.settings;
 			this.globalSettingsLoadError = null;
@@ -531,7 +601,12 @@ export class SettingsManager {
 		this.modifiedProjectFields.clear();
 		this.modifiedProjectNestedFields.clear();
 
-		const projectLoad = SettingsManager.tryLoadFromStorage(this.storage, "project", this.projectTrusted);
+		const projectLoad = SettingsManager.tryLoadFromStorage(
+			this.storage,
+			"project",
+			this.projectTrusted,
+			this.managedMode,
+		);
 		if (!projectLoad.error) {
 			this.projectSettings = projectLoad.settings;
 			this.projectSettingsLoadError = null;
@@ -540,7 +615,7 @@ export class SettingsManager {
 			this.recordError("project", projectLoad.error);
 		}
 
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		this.recomputeEffectiveSettings();
 	}
 
 	/** Apply additional overrides on top of current settings */
@@ -548,8 +623,18 @@ export class SettingsManager {
 		this.settings = deepMergeSettings(this.settings, overrides);
 	}
 
+	/** Apply process-scoped overrides that must remain above local settings after reloads. */
+	applyRuntimeOverrides(overrides: Partial<Settings>): void {
+		this.runtimeOverrides = deepMergeSettings(this.runtimeOverrides, overrides);
+		this.recomputeEffectiveSettings();
+	}
+
 	/** Mark a global field as modified during this session */
 	private markModified(field: keyof Settings, nestedKey?: string): void {
+		if (this.managedMode && !MANAGED_MODE_LOCAL_SETTING_KEYS.has(field)) {
+			delete (this.globalSettings as Record<string, unknown>)[field];
+			return;
+		}
 		this.modifiedFields.add(field);
 		if (nestedKey) {
 			if (!this.modifiedNestedFields.has(field)) {
@@ -645,7 +730,7 @@ export class SettingsManager {
 	}
 
 	private save(): void {
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		this.recomputeEffectiveSettings();
 
 		if (this.globalSettingsLoadError) {
 			return;
@@ -663,7 +748,7 @@ export class SettingsManager {
 	private saveProjectSettings(settings: Settings): void {
 		this.assertProjectTrustedForWrite();
 		this.projectSettings = structuredClone(settings);
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		this.recomputeEffectiveSettings();
 
 		if (this.projectSettingsLoadError) {
 			return;
@@ -678,6 +763,7 @@ export class SettingsManager {
 	}
 
 	private updateProjectSettings(field: keyof Settings, update: (settings: Settings) => void): void {
+		if (this.managedMode) return;
 		this.assertProjectTrustedForWrite();
 		const projectSettings = structuredClone(this.projectSettings);
 		update(projectSettings);
@@ -1160,6 +1246,7 @@ export class SettingsManager {
 		if (this.settings.terminal?.clearOnShrink !== undefined) {
 			return this.settings.terminal.clearOnShrink;
 		}
+		if (this.managedMode) return false;
 		return process.env.PI_CLEAR_ON_SHRINK === "1";
 	}
 
@@ -1280,7 +1367,7 @@ export class SettingsManager {
 	}
 
 	getShowHardwareCursor(): boolean {
-		return this.settings.showHardwareCursor ?? process.env.PI_HARDWARE_CURSOR === "1";
+		return this.settings.showHardwareCursor ?? (!this.managedMode && process.env.PI_HARDWARE_CURSOR === "1");
 	}
 
 	setShowHardwareCursor(enabled: boolean): void {

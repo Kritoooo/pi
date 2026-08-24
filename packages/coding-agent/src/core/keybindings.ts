@@ -338,6 +338,12 @@ function loadRawConfig(path: string): Record<string, unknown> | undefined {
 	}
 }
 
+let userKeybindingsEnabled = true;
+
+export function setUserKeybindingsEnabled(enabled: boolean): void {
+	userKeybindingsEnabled = enabled;
+}
+
 export class KeybindingsManager extends TuiKeybindingsManager {
 	private configPath: string | undefined;
 
@@ -347,6 +353,7 @@ export class KeybindingsManager extends TuiKeybindingsManager {
 	}
 
 	static create(agentDir: string = getAgentDir()): KeybindingsManager {
+		if (!userKeybindingsEnabled) return new KeybindingsManager();
 		const configPath = join(agentDir, "keybindings.json");
 		const userBindings = KeybindingsManager.loadFromFile(configPath);
 		return new KeybindingsManager(userBindings, configPath);

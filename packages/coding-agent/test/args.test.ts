@@ -112,6 +112,12 @@ describe("parseArgs", () => {
 			expect(result.unknownFlags.size).toBe(0);
 		});
 
+		test("parses --no-managed-config", () => {
+			const result = parseArgs(["--no-managed-config"]);
+			expect(result.noManagedConfig).toBe(true);
+			expect(result.unknownFlags.size).toBe(0);
+		});
+
 		test.each(["--managed-config-url", "--managed-config-token"])("reports a missing value for %s", (flag) => {
 			const result = parseArgs([flag]);
 			expect(result.diagnostics).toEqual([{ type: "error", message: `${flag} requires a value` }]);

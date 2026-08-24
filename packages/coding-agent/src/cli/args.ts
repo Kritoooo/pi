@@ -16,6 +16,7 @@ export interface Args {
 	apiKey?: string;
 	managedConfigUrl?: string;
 	managedConfigToken?: string;
+	noManagedConfig?: boolean;
 	systemPrompt?: string;
 	appendSystemPrompt?: string[];
 	thinking?: ThinkingLevel;
@@ -116,6 +117,8 @@ export function parseArgs(args: string[]): Args {
 				result.managedConfigToken = value;
 				i++;
 			}
+		} else if (arg === "--no-managed-config") {
+			result.noManagedConfig = true;
 		} else if (arg === "--system-prompt" && i + 1 < args.length) {
 			result.systemPrompt = args[++i];
 		} else if (arg === "--append-system-prompt" && i + 1 < args.length) {
@@ -287,8 +290,9 @@ ${chalk.bold("Options:")}
   --provider <name>              Provider name (default: google)
   --model <pattern>              Model pattern or ID (supports "provider/id" and optional ":<thinking>")
   --api-key <key>                API key (defaults to env vars)
-  --managed-config-url <url>     Use an HTTPS managed provider configuration snapshot
+  --managed-config-url <url>     Use an authoritative HTTPS managed configuration snapshot
   --managed-config-token <token> Bearer token used only to fetch managed configuration
+  --no-managed-config            Ignore managed configuration and use local sources
   --system-prompt <text>         System prompt (default: coding assistant prompt)
   --append-system-prompt <text>  Append text or file contents to the system prompt (can be used multiple times)
   --mode <mode>                  Output mode: text (default), json, or rpc
@@ -440,6 +444,7 @@ ${chalk.bold("Environment Variables:")}
   PI_OFFLINE                       - Disable startup network operations when set to 1/true/yes
   PI_MANAGED_CONFIG_URL            - Enable managed mode using this configuration URL
   PI_MANAGED_CONFIG_TOKEN          - Bearer token used only to fetch managed configuration
+  PI_MANAGED_CONFIG_DISABLED       - Ignore managed configuration when set to 1/true/yes
   PI_TELEMETRY                     - Override install telemetry when set to 1/true/yes or 0/false/no
   PI_SHARE_VIEWER_URL              - Base URL for /share command (default: https://pi.dev/session/)
 
